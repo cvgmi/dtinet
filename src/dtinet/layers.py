@@ -7,9 +7,6 @@ class SPD3ToLC(nn.Module):
     Log-Cholesky coordinate map SPD(3) → 𝐑⁶.
     """
 
-    def __init__(self):
-        super().__init__()
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass.
@@ -49,7 +46,7 @@ class SPD3ToLC(nn.Module):
         )
 
 
-class LCWeightedFrechetMean3d(nn.Module):
+class WeightedFrechetMean3dLC(nn.Module):
     """
     Weighted Fréchet mean layer for SPD-valued 3D lattice data under the log-Cholesky metric (LCM).
 
@@ -114,10 +111,7 @@ class LCWeightedFrechetMean3d(nn.Module):
         """
         B, _, F, D, H, W = x.shape
 
-        x_folded = (
-            x.permute(0, 2, 1, 3, 4, 5)
-            .reshape(B * F, self.in_channels, D, H, W)
-        )
+        x_folded = x.permute(0, 2, 1, 3, 4, 5).reshape(B * F, self.in_channels, D, H, W)
 
         weight = self.constrain_weight()
 
@@ -135,3 +129,29 @@ class LCWeightedFrechetMean3d(nn.Module):
             .permute(0, 2, 1, 3, 4, 5)
             .contiguous()
         )
+
+
+class InvariantReadoutLC(nn.Module):
+    """
+    Invariant readout for log-Cholesky feature maps.
+
+    Computes the Euclidean distance in log-Cholesky coordinates from each feature vector to the
+    channel-wise mean. This converts the log-Cholesky coordinate field to a scalar distance field.
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input log-Cholesky feature map of shape (B, C, F, D, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Output distance field of shape (B, C, D, H, W).
+
+        """
+        return (x - x.mean(dim=1, keepdim=True)).norm(dim=2)
