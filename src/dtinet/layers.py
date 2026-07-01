@@ -58,6 +58,19 @@ class WeightedFrechetMean3dLC(nn.Module):
     1. Ensure weights satisfy a convexity constraint.
     2. Ensure weights are shared across log-Cholesky coordinates.
 
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    out_channels : int
+        Number of output channels.
+    kernel_size : int
+        Size of the cubic kernel.
+    stride : int, optional
+        Stride of cubic kernel.
+    padding : int, optional
+        Padding applied to the input.
+
     """
 
     def __init__(
