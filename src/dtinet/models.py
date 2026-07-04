@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 from dtinet.layers import InvariantReadoutLC, SPD3ToLC, WeightedFrechetMean3dLC
@@ -46,12 +47,12 @@ class DTINetLC(nn.Module):
             c_in = c_out
 
         self.to_lc = SPD3ToLC()
-        self.encoder = nn.Sequential(*layers)
+        self.encoder = nn.ModuleList(layers)
         self.readout = InvariantReadoutLC()
         self.pool = nn.AdaptiveAvgPool3d(1)
         self.head = nn.Linear(c_in, num_classes)
 
-    def forward(self, x):
+    def forward(self, x, mask: torch.Tensor | None = None):
         """
         Forward pass.
 
@@ -59,6 +60,8 @@ class DTINetLC(nn.Module):
         ----------
         x : torch.Tensor
             Input Voigt-encoded SPD(3) field of shape (B, C_in, 6, D, H, W).
+        mask : torch.Tensor or None, optional
+            Binary spatial mask of shape (B, 1, D, H, W).
 
         Returns
         -------
@@ -66,10 +69,23 @@ class DTINetLC(nn.Module):
             Output class logits of shape (B, num_classes).
 
         """
-        x = self.to_lc(x)
-        x = self.encoder(x)
-        x = self.readout(x)
-        x = self.pool(x).flatten(start_dim=1)
+        x = self.to_lc(x, mask)
+        for layer in self.encoder:
+            if isinstance(layer, WeightedFrechetMean3dLC):
+                if mask is None:
+                    x = layer(x)
+                else:
+                    x, mask = layer(x, mask)
+            else:
+                x = layer(x)
+                if mask is not None:
+                    x = x * mask.unsqueeze(2)
+
+        x = self.readout(x, mask)
+        if mask is None:
+            x = self.pool(x).flatten(start_dim=1)
+        else:
+            x = (x * mask).sum(dim=(2, 3, 4)) / mask.sum(dim=(2, 3, 4)).clamp_min(1)
         return self.head(x)
 
 
