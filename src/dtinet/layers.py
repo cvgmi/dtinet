@@ -7,7 +7,9 @@ class SPD3ToLC(nn.Module):
     Log-Cholesky coordinate map SPD(3) → 𝐑⁶.
     """
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Forward pass.
 
@@ -15,6 +17,8 @@ class SPD3ToLC(nn.Module):
         ----------
         x : torch.Tensor
             Input Voigt-encoded SPD(3) field of shape (B, C, 6, D, H, W).
+        mask : torch.Tensor or None, optional
+            Binary spatial mask of shape (B, 1, D, H, W).
 
         Returns
         -------
@@ -22,6 +26,13 @@ class SPD3ToLC(nn.Module):
             Output log-Cholesky factor field of shape (B, C, 6, D, H, W).
 
         """
+        if mask is not None:
+            # set all voxels outside the mask to be the identity matrix
+            mask = mask.unsqueeze(2)
+            identity = x.new_tensor((1.0, 0.0, 1.0, 0.0, 0.0, 1.0))
+            identity = identity.view(1, 1, 6, 1, 1, 1)
+            x = torch.where(mask.bool(), x, identity)
+
         xx, xy, yy, xz, yz, zz = x.unbind(dim=2)
 
         # entries of the Cholesky factor are known in closed form. there is no need to call
@@ -33,7 +44,7 @@ class SPD3ToLC(nn.Module):
         l21 = (yz - l20 * l10) / l11
         l22 = torch.sqrt(zz - l20.square() - l21.square())
 
-        return torch.stack(
+        out = torch.stack(
             (
                 torch.log(l00),
                 torch.log(l11),
@@ -44,6 +55,11 @@ class SPD3ToLC(nn.Module):
             ),
             dim=2,
         )
+
+        if mask is not None:
+            out = out * mask
+
+        return out
 
 
 class WeightedFrechetMean3dLC(nn.Module):
@@ -107,7 +123,9 @@ class WeightedFrechetMean3dLC(nn.Module):
         w = nn.functional.softmax(w, dim=-1)
         return w.view_as(self.weight)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass.
 
@@ -115,33 +133,77 @@ class WeightedFrechetMean3dLC(nn.Module):
         ----------
         x : torch.Tensor
             Input feature map of shape (B, C_in, F, D_in, H_in, W_in).
+        mask : torch.Tensor or None, optional
+            Binary spatial mask of shape (B, 1, D_in, H_in, W_in).
 
         Returns
         -------
         torch.Tensor
             Output feature map of shape (B, C_out, F, D_out, H_out, W_out).
+        tuple[torch.Tensor, torch.Tensor]
+            Output feature map and propagated binary mask of shape (B, 1, D_out, H_out, W_out).
 
         """
-        B, _, F, D, H, W = x.shape
+        B, C, F, D, H, W = x.shape
 
-        x_folded = x.permute(0, 2, 1, 3, 4, 5).reshape(B * F, self.in_channels, D, H, W)
+        # fold the log-Cholesky coordinate axis into the batch axis so the same Conv3d kernel is
+        # applied independently to every log-Cholesky coordinate
+        x = x.permute(0, 2, 1, 3, 4, 5).reshape(B * F, C, D, H, W)
 
         weight = self.constrain_weight()
 
+        if mask is None:
+            y = nn.functional.conv3d(
+                x,
+                weight,
+                bias=None,
+                stride=self.stride,
+                padding=self.padding,
+            )
+            D_out, H_out, W_out = y.shape[-3:]
+            y = y.reshape(B, F, self.out_channels, D_out, H_out, W_out).permute(0, 2, 1, 3, 4, 5)
+            return y
+
+        # replicate the mask across log-Cholesky coordinates and fold it in the same way as x so
+        # each coordinate sees the same valid support
+        mask = (
+            mask.unsqueeze(1)
+            .expand(B, F, 1, D, H, W)
+            .reshape(B * F, 1, D, H, W)
+            .to(dtype=x.dtype)
+        )
+
+        # remove invalid samples from the weighted numerator
+        x = x * mask
+
         y = nn.functional.conv3d(
-            x_folded,
+            x,
             weight,
             bias=None,
             stride=self.stride,
             padding=self.padding,
         )
-
         D_out, H_out, W_out = y.shape[-3:]
-        return (
-            y.view(B, F, self.out_channels, D_out, H_out, W_out)
-            .permute(0, 2, 1, 3, 4, 5)
-            .contiguous()
+
+        # renormalize surviving convex weights over valid samples only
+        denom = nn.functional.conv3d(
+            mask,
+            weight.sum(dim=1, keepdim=True),
+            bias=None,
+            stride=self.stride,
+            padding=self.padding,
         )
+
+        valid = denom > 0
+        y = y / denom.clamp_min(torch.finfo(y.dtype).eps)
+        y = torch.where(valid, y, torch.zeros_like(y))
+
+        y = y.reshape(B, F, self.out_channels, D_out, H_out, W_out).permute(0, 2, 1, 3, 4, 5)
+        denom = denom.reshape(B, F, self.out_channels, D_out, H_out, W_out)
+        out_mask = denom[:, 0, :1] > 0 
+
+        return y, out_mask
+
 
 
 class InvariantReadoutLC(nn.Module):
@@ -152,7 +214,9 @@ class InvariantReadoutLC(nn.Module):
     channel-wise mean. This converts the log-Cholesky coordinate field to a scalar distance field.
     """
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, mask: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Forward pass.
 
@@ -160,6 +224,8 @@ class InvariantReadoutLC(nn.Module):
         ----------
         x : torch.Tensor
             Input log-Cholesky feature map of shape (B, C, F, D, H, W).
+        mask : torch.Tensor or None, optional
+            Binary spatial mask of shape (B, 1, D, H, W).
 
         Returns
         -------
@@ -167,4 +233,9 @@ class InvariantReadoutLC(nn.Module):
             Output distance field of shape (B, C, D, H, W).
 
         """
-        return (x - x.mean(dim=1, keepdim=True)).norm(dim=2)
+        out = (x - x.mean(dim=1, keepdim=True)).norm(dim=2)
+
+        if mask is not None:
+            out = out * mask
+
+        return out
