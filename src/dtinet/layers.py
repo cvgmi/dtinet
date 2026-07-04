@@ -7,9 +7,7 @@ class SPD3ToLC(nn.Module):
     Log-Cholesky coordinate map SPD(3) → 𝐑⁶.
     """
 
-    def forward(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Forward pass.
 
@@ -146,35 +144,28 @@ class WeightedFrechetMean3dLC(nn.Module):
         """
         B, C, F, D, H, W = x.shape
 
+        provided_mask = mask is not None
+
+        if mask is None and self.padding > 0:
+            mask = torch.ones(B, 1, D, H, W, device=x.device, dtype=x.dtype)
+
         # fold the log-Cholesky coordinate axis into the batch axis so the same Conv3d kernel is
         # applied independently to every log-Cholesky coordinate
         x = x.permute(0, 2, 1, 3, 4, 5).reshape(B * F, C, D, H, W)
 
         weight = self.constrain_weight()
 
-        if mask is None:
-            y = nn.functional.conv3d(
-                x,
-                weight,
-                bias=None,
-                stride=self.stride,
-                padding=self.padding,
+        if mask is not None:
+            # replicate the mask across log-Cholesky coordinates and fold it in the same way as x so
+            # each coordinate sees the same valid support
+            mask = (
+                mask.unsqueeze(1)
+                .expand(B, F, 1, D, H, W)
+                .reshape(B * F, 1, D, H, W)
+                .to(dtype=x.dtype)
             )
-            D_out, H_out, W_out = y.shape[-3:]
-            y = y.reshape(B, F, self.out_channels, D_out, H_out, W_out).permute(0, 2, 1, 3, 4, 5)
-            return y
-
-        # replicate the mask across log-Cholesky coordinates and fold it in the same way as x so
-        # each coordinate sees the same valid support
-        mask = (
-            mask.unsqueeze(1)
-            .expand(B, F, 1, D, H, W)
-            .reshape(B * F, 1, D, H, W)
-            .to(dtype=x.dtype)
-        )
-
-        # remove invalid samples from the weighted numerator
-        x = x * mask
+            # remove invalid samples from the weighted numerator
+            x = x * mask
 
         y = nn.functional.conv3d(
             x,
@@ -185,25 +176,28 @@ class WeightedFrechetMean3dLC(nn.Module):
         )
         D_out, H_out, W_out = y.shape[-3:]
 
-        # renormalize surviving convex weights over valid samples only
-        denom = nn.functional.conv3d(
-            mask,
-            weight.sum(dim=1, keepdim=True),
-            bias=None,
-            stride=self.stride,
-            padding=self.padding,
-        )
-
-        valid = denom > 0
-        y = y / denom.clamp_min(torch.finfo(y.dtype).eps)
-        y = torch.where(valid, y, torch.zeros_like(y))
+        if mask is not None:
+            # renormalize surviving convex weights over valid samples only
+            denom = nn.functional.conv3d(
+                mask,
+                weight.sum(dim=1, keepdim=True),
+                bias=None,
+                stride=self.stride,
+                padding=self.padding,
+            )
+            valid = denom > 0
+            y = y / denom.clamp_min(torch.finfo(y.dtype).eps)
+            y = torch.where(valid, y, torch.zeros_like(y))
+            # construct output mask to be propagated
+            denom = denom.reshape(B, F, self.out_channels, D_out, H_out, W_out)
+            out_mask = denom[:, 0, :1] > 0
 
         y = y.reshape(B, F, self.out_channels, D_out, H_out, W_out).permute(0, 2, 1, 3, 4, 5)
-        denom = denom.reshape(B, F, self.out_channels, D_out, H_out, W_out)
-        out_mask = denom[:, 0, :1] > 0 
+
+        if not provided_mask: 
+            return y
 
         return y, out_mask
-
 
 
 class InvariantReadoutLC(nn.Module):
@@ -214,9 +208,7 @@ class InvariantReadoutLC(nn.Module):
     channel-wise mean. This converts the log-Cholesky coordinate field to a scalar distance field.
     """
 
-    def forward(
-        self, x: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
         """
         Forward pass.
 
