@@ -12,3 +12,13 @@ dependencies = [
 dev = [
     "ruff>=0.15.20",
 ]
+
+[tool.ruff]
+line-length = 100
+src = ["src"]
+target-version = "py311"
+
+[tool.ruff.lint]
+ignore = ["E741"]
+select = ["E", "F", "I"]
+
