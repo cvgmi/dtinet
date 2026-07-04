@@ -194,10 +194,120 @@ class WeightedFrechetMean3dLC(nn.Module):
 
         y = y.reshape(B, F, self.out_channels, D_out, H_out, W_out).permute(0, 2, 1, 3, 4, 5)
 
-        if not provided_mask: 
+        if not provided_mask:
             return y
 
         return y, out_mask
+
+
+class FrechetBatchNorm3dLC(nn.Module):
+    """
+    Fréchet batch normalization for log-Cholesky feature maps.
+
+    Under the LCM, the Fréchet mean and variance are the Euclidean mean and squared distance in
+    log-Cholesky coordinates. This layer normalizes each channel by its batch Fréchet mean and
+    geodesic variance, then translates it to a learned Fréchet mean.
+
+    Parameters
+    ----------
+    num_channels : int
+        Number of input channels.
+    num_coordinates : int, optional
+        Number of log-Cholesky coordinates.
+    eps : float, optional
+        Value added to the variance for numerical stability.
+    momentum : float, optional
+        Momentum used to update running Fréchet statistics.
+
+    """
+
+    def __init__(
+        self,
+        num_channels: int,
+        num_coordinates: int = 6,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+    ):
+        super().__init__()
+
+        self.num_channels = num_channels
+        self.num_coordinates = num_coordinates
+        self.eps = eps
+        self.momentum = momentum
+
+        # learned target Fréchet mean and positive geodesic scale for each channel
+        self.bias = nn.Parameter(torch.zeros(num_channels, num_coordinates))
+        self.log_scale = nn.Parameter(torch.zeros(num_channels))
+        self.register_buffer("running_mean", torch.zeros(num_channels, num_coordinates))
+        self.register_buffer("running_var", torch.ones(num_channels))
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input feature map of shape (B, C, F, D, H, W).
+        mask : torch.Tensor or None, optional
+            Binary spatial mask of shape (B, 1, D, H, W).
+
+        Returns
+        -------
+        torch.Tensor
+            Output feature map of shape (B, C, F, D, H, W).
+
+        """
+        B, C, F, D, H, W = x.shape
+
+        if self.training:
+            # Euclidean statistics in LC coordinates are Fréchet statistics under the LCM
+            if mask is None:
+                N = B * D * H * W
+                batch_mean = x.mean(dim=(0, 3, 4, 5))
+                centered = x - batch_mean.view(1, C, F, 1, 1, 1)
+                # sum over coordinates gives one scalar Fréchet variance per channel
+                batch_var = centered.square().sum(dim=2)
+                batch_var = batch_var.mean(dim=(0, 2, 3, 4))
+            else:
+                mask = mask.to(dtype=x.dtype)
+                N = int(mask.sum().item())
+                if N > 0:
+                    # exclude invalid voxels from both the mean and variance
+                    batch_mean = (x * mask.unsqueeze(2)).sum(dim=(0, 3, 4, 5)) / N
+                    centered = x - batch_mean.view(1, C, F, 1, 1, 1)
+                    batch_var = centered.square().sum(dim=2)
+                    batch_var = (batch_var * mask).sum(dim=(0, 2, 3, 4)) / N
+                else:
+                    # an empty mask has no batch statistics, so retain the running estimates
+                    batch_mean = self.running_mean
+                    batch_var = self.running_var
+
+            if mask is None or N > 0:
+                # keep biased batch variance for this pass; debias only the running estimate
+                running_var_update = batch_var.detach()
+                if N > 1:
+                    running_var_update = running_var_update * N / (N - 1)
+                self.running_mean.mul_(1 - self.momentum).add_(batch_mean.detach() * self.momentum)
+                self.running_var.mul_(1 - self.momentum).add_(running_var_update * self.momentum)
+
+            mean = batch_mean
+            var = batch_var
+
+        else:
+            mean = self.running_mean
+            var = self.running_var
+
+        # normalize geodesic dispersion, then translate to the learned Fréchet mean
+        out = x - mean.view(1, C, F, 1, 1, 1)
+        out = out * (self.log_scale.exp() / torch.sqrt(var + self.eps)).view(1, C, 1, 1, 1, 1)
+        out = out + self.bias.view(1, C, F, 1, 1, 1)
+
+        if mask is not None:
+            # zeros are a computational placeholder; downstream layers must propagate the mask
+            out = out * mask.unsqueeze(2)
+
+        return out
 
 
 class InvariantReadoutLC(nn.Module):
