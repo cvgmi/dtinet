@@ -1,7 +1,12 @@
 import torch
 import torch.nn as nn
 
-from dtinet.layers import InvariantReadoutLC, SPD3ToLC, WeightedFrechetMean3dLC
+from dtinet.layers import (
+    FrechetBatchNorm3dLC,
+    InvariantReadoutLC,
+    SPD3ToLC,
+    WeightedFrechetMean3dLC,
+)
 
 
 class DTINetLC(nn.Module):
@@ -42,6 +47,7 @@ class DTINetLC(nn.Module):
         c_in = 1
         for c_out in num_channels:
             layers.append(WeightedFrechetMean3dLC(c_in, c_out, **kwargs))
+            layers.append(FrechetBatchNorm3dLC(c_out))
             if activation is not None:
                 layers.append(_build_activation(activation))
             c_in = c_out
@@ -72,20 +78,24 @@ class DTINetLC(nn.Module):
         x = self.to_lc(x, mask)
         for layer in self.encoder:
             if isinstance(layer, WeightedFrechetMean3dLC):
-                if mask is None:
-                    x = layer(x)
-                else:
+                if mask is not None:
                     x, mask = layer(x, mask)
+                else:
+                    x = layer(x)
+            elif isinstance(layer, FrechetBatchNorm3dLC):
+                x = layer(x, mask)
             else:
                 x = layer(x)
                 if mask is not None:
                     x = x * mask.unsqueeze(2)
 
         x = self.readout(x, mask)
+
         if mask is None:
             x = self.pool(x).flatten(start_dim=1)
         else:
             x = (x * mask).sum(dim=(2, 3, 4)) / mask.sum(dim=(2, 3, 4)).clamp_min(1)
+
         return self.head(x)
 
 
