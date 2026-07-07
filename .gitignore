@@ -44,3 +44,18 @@ pip-wheel-metadata/
 .DS_Store
 Thumbs.db
 
+# user-provided data and generated outputs
+/data/*
+!/data/.gitkeep
+/runs/
+*.nii
+*.nii.gz
+*.h5
+*.hdf5
+*.pt
+*.pth
+
+# local configuration is private; portable examples may be committed
+/configs/*.yaml
+!/configs/*.example.yaml
+!/configs/.gitkeep
