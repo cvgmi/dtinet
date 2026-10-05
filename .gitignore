@@ -59,3 +59,8 @@ Thumbs.db
 /configs/*.yaml
 !/configs/*.example.yaml
 !/configs/.gitkeep
+
+# local tool state
+.uv/
+.memory/
+.pi/
