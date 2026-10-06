@@ -151,7 +151,8 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"epoch {epoch:02d}/{args.epochs} "
             f"train loss {train_loss / train_total:.4f} acc {train_correct / train_total:.4f} "
-            f"val loss {val_loss:.4f} acc {val_acc:.4f}"
+            f"val loss {val_loss:.4f} acc {val_acc:.4f}",
+            flush=True,
         )
 
     if val_acc < TARGET_ACCURACY:

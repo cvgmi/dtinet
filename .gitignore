@@ -64,3 +64,8 @@ Thumbs.db
 .uv/
 .memory/
 .pi/
+
+# site-specific job files (HPC/Slurm) and their logs
+*.sbatch
+/slurm/
+/logs/
