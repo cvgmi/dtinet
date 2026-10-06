@@ -38,9 +38,18 @@ class WeightedFrechetMean3dAIM(BaseWeightedFrechetMean3d):
 
     Each output voxel is the recursive (inductive) weighted Fréchet mean of the SPD matrices in
     the corresponding input window: the running mean starts at the first valid fiber and each
-    subsequent valid fiber is folded in with an exact two-point geodesic mean. Weights are
-    constrained to the open interval (0, 1) by clamping; unlike the coordinate-metric layer,
-    they are not required to sum to one.
+    subsequent valid fiber is folded in with an exact two-point geodesic mean.
+
+    Weight semantics (following the reference ManifoldNet implementation): the weights are
+    learnable *geodesic gates* — fiber ``k`` is folded in via ``running = fiber_k #_{w_k}
+    running``, so ``w_k`` is the fraction retained of the running mean. This is NOT the
+    mass-weighted iFME recursion of the paper (Eq. 4, fraction ``w_k / sum_{i<=k} w_i``
+    weighting the new fiber); independent gates implicitly parameterize simplex masses, so
+    the parameterizations are equivalent up to reparameterization. Weights are constrained
+    to the open interval (0, 1) by clamping; unlike the coordinate-metric layer, they are
+    not required to sum to one. Masked-out fibers are skipped WITHOUT renormalizing the
+    surviving gates, so effective masses are mask-dependent (gates are learned jointly
+    with the mask distribution of the data).
 
     Parameters
     ----------
@@ -188,7 +197,10 @@ class FrechetBatchNorm3dAIM(BaseFrechetBatchNorm3d):
     Each channel is centered at its batch Fréchet mean via the AIM logarithm, the tangent
     vectors are scaled by a learned positive factor over the geodesic standard deviation,
     parallel-transported to a learned target Fréchet mean ``expm(bias)``, and mapped back onto
-    the manifold via the AIM exponential. Running statistics are tracked with a momentum
+    the manifold via the AIM exponential. The transport is the genuine geodesic parallel
+    transport (an isometry); the two-hop construction of Brooks et al. (transport to the
+    identity, then congruence to the target) is an isometry as well, but differs by a
+    holonomy rotation for noncommuting means. Running statistics are tracked with a momentum
     update (geodesic EMA for the mean) for use in evaluation mode.
 
     Parameters
@@ -265,7 +277,9 @@ class FrechetBatchNorm3dAIM(BaseFrechetBatchNorm3d):
             fm = karcher_wfm(x_set, weights, dim=-3)
             w_sum = weights.sum(dim=-1)
             has_stats = w_sum > 0
-            w_norm = weights / w_sum.clamp_min(torch.finfo(x.dtype).eps).unsqueeze(-1)
+            # divide by the true weight sum wherever it is positive (see karcher_wfm)
+            w_sum_safe = torch.where(has_stats, w_sum, torch.ones_like(w_sum)).unsqueeze(-1)
+            w_norm = weights / w_sum_safe
             var = (w_norm * aim_distance_sq(x_set, fm.unsqueeze(-3))).sum(dim=-1)
 
             # channels without valid voxels fall back to the running statistics

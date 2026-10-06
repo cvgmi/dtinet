@@ -161,8 +161,10 @@ class WeightedFrechetMean3dCoords(BaseWeightedFrechetMean3d):
                 padding=self.padding,
             )
             valid = denom > 0
-            y = y / denom.clamp_min(torch.finfo(y.dtype).eps)
-            y = torch.where(valid, y, torch.zeros_like(y))
+            # divide by the true surviving mass; an epsilon floor would squash
+            # tiny-but-positive masses (heavily masked windows) toward zero
+            denom_safe = torch.where(valid, denom, torch.ones_like(denom))
+            y = torch.where(valid, y / denom_safe, torch.zeros_like(y))
             # construct output mask to be propagated
             denom = denom.reshape(B, F, self.out_channels, D_out, H_out, W_out)
             out_mask = denom[:, 0, :1] > 0

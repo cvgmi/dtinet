@@ -220,7 +220,9 @@ def karcher_wfm(
 
     w_sum = w.sum(dim=-1, keepdim=True)
     has_mass = w_sum > 0
-    w = w / w_sum.clamp_min(torch.finfo(x.dtype).eps)
+    # divide by the true sum wherever it is positive; an epsilon floor would
+    # squash tiny-but-legitimate masses toward zero
+    w = w / torch.where(has_mass, w_sum, torch.ones_like(w_sum))
     w_mat = w.unsqueeze(-1).unsqueeze(-1)
 
     # weighted arithmetic mean of SPD matrices is SPD for non-negative weights

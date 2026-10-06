@@ -14,7 +14,8 @@ import torch
 VOIGT6_DIAG = (0, 2, 5)
 VOIGT6_OFFDIAG = (1, 3, 4)
 
-#: Eigenvalue gap below which the eigh backward treats a pair as degenerate.
+#: Eigenvalue gap (relative to the spectral scale) below which the Loewner
+#: divided difference in the spectral-function backward uses the limit f'(λ).
 EIGH_GAP_EPS = 1e-12
 
 #: Batch count at which cuSOLVER's batched symmetric eigensolver
@@ -73,34 +74,62 @@ def _linalg_eigh(m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return evals.reshape(*m.shape[:-1]), evecs.reshape(*m.shape)
 
 
-class _SafeEigh(torch.autograd.Function):
+class _SpectralFunc(torch.autograd.Function):
     """
-    Symmetric eigendecomposition with a degeneracy-safe backward pass.
+    Spectral function f(M) = U f(Λ) Uᵀ of a symmetric matrix, with the exact backward.
 
-    The standard spectral gradient couples eigenvector gradients through 1/(λ_i − λ_j) terms,
-    which are singular at repeated eigenvalues (e.g. the identity matrix, or any isotropic
-    tangent vector). This wrapper zeroes the coupling terms for eigenvalue pairs closer than
-    ``EIGH_GAP_EPS``: for functions that are symmetric within the degenerate subspace (all
-    spectral functions used here) those terms vanish in the limit anyway, and gradients stay
-    finite everywhere else.
+    The gradient of a spectral function involves the Loewner (divided-difference) matrix
+    K_ij = (f(λ_i) − f(λ_j)) / (λ_i − λ_j), whose diagonal and degenerate limit is f'(λ_i):
+    ``grad = U (K ⊙ Uᵀ G U) Uᵀ``. Note that the coupling between (near-)degenerate
+    eigenpairs is f'(λ_i), NOT zero: zeroing it (the naive degeneracy guard) silently
+    discards the eigenvector-direction derivative — e.g. it makes the gradient of log(M)
+    vanish along off-diagonal directions at M = I, which is exactly where identity padding
+    and isotropic tensors live. The divided-difference form is finite everywhere f is
+    differentiable and needs no special-casing beyond the limit value.
     """
 
     @staticmethod
-    def forward(ctx, m):
+    def forward(ctx, m, fn, fn_prime, clamp_min, p_exp):
         evals, evecs = _linalg_eigh(m)
-        ctx.save_for_backward(evals, evecs)
-        return evals, evecs
+        if clamp_min is not None:
+            clamped = evals < clamp_min
+            evals = evals.clamp_min(clamp_min)
+        else:
+            clamped = torch.zeros_like(evals, dtype=torch.bool)
+        f_evals = fn(evals)
+        # clamp_min is (locally) constant in the clamped region, so f' vanishes there
+        fp_evals = torch.where(clamped, torch.zeros_like(evals), fn_prime(evals))
+        ctx.save_for_backward(evals, f_evals, fp_evals, evecs)
+        ctx.p_exp = p_exp
+        return (evecs * f_evals.unsqueeze(-2)) @ evecs.transpose(-1, -2)
 
     @staticmethod
-    def backward(ctx, grad_evals, grad_evecs):
-        evals, evecs = ctx.saved_tensors
-        # F_ij = 1/(λ_j − λ_i), zeroed on the diagonal and for near-degenerate pairs
-        gap = evals.unsqueeze(-2) - evals.unsqueeze(-1)
-        f = torch.where(gap.abs() < EIGH_GAP_EPS, torch.zeros_like(gap), gap.reciprocal())
-        grad = grad_evals.diag_embed() + f * (evecs.transpose(-1, -2) @ grad_evecs)
-        grad = evecs @ grad @ evecs.transpose(-1, -2)
+    def backward(ctx, grad_out):
+        evals, f_evals, fp_evals, evecs = ctx.saved_tensors
+        gap = evals.unsqueeze(-2) - evals.unsqueeze(-1)  # (..., i, j) = λ_i − λ_j
+        f_gap = f_evals.unsqueeze(-2) - f_evals.unsqueeze(-1)
+        # scale-aware degeneracy threshold: eigenvalue gaps below this carry no
+        # resolvable information at the working precision, so use the limit f'(λ_i)
+        scale = evals.abs().amax(dim=-1, keepdim=True).unsqueeze(-1).clamp_min(1.0)
+        degenerate = gap.abs() < EIGH_GAP_EPS * scale
+        gap_safe = torch.where(degenerate, torch.ones_like(gap), gap)
+        loewner = torch.where(degenerate, fp_evals.unsqueeze(-1).expand_as(gap), f_gap / gap_safe)
+        g_eig = evecs.transpose(-1, -2) @ grad_out @ evecs
+        grad = evecs @ (loewner * g_eig) @ evecs.transpose(-1, -2)
         grad = (grad + grad.transpose(-1, -2)) / 2
-        return grad
+
+        grad_p = None
+        if ctx.p_exp is not None:
+            # f(λ) = λ^p varies with p as ∂f/∂p = λ^p ln λ, diagonal in the eigenbasis
+            grad_p = (g_eig.diagonal(dim1=-2, dim2=-1) * f_evals * torch.log(evals))
+            grad_p = grad_p.sum(dim=-1, keepdim=True)
+            # reduce broadcast dimensions back to the shape of the p argument
+            while grad_p.dim() > ctx.p_exp.dim():
+                grad_p = grad_p.sum(dim=0)
+            for i, size in enumerate(ctx.p_exp.shape):
+                if size == 1 and grad_p.shape[i] > 1:
+                    grad_p = grad_p.sum(dim=i, keepdim=True)
+        return grad, None, None, None, grad_p
 
 
 def voigt6_to_matrix(x: torch.Tensor) -> torch.Tensor:
@@ -160,13 +189,11 @@ def matrix_to_voigt6(m: torch.Tensor, offdiag_scale: float = 1.0) -> torch.Tenso
     )
 
 
-def _sym_eigh_func(m: torch.Tensor, fn, clamp_min: float | None) -> torch.Tensor:
+def _sym_eigh_func(
+    m: torch.Tensor, fn, fn_prime, clamp_min: float | None, p_exp: torch.Tensor | None = None
+) -> torch.Tensor:
     m = (m + m.transpose(-1, -2)) / 2
-    evals, evecs = _SafeEigh.apply(m)
-    if clamp_min is not None:
-        evals = evals.clamp_min(clamp_min)
-    evals = fn(evals)
-    return (evecs * evals.unsqueeze(-2)) @ evecs.transpose(-1, -2)
+    return _SpectralFunc.apply(m, fn, fn_prime, clamp_min, p_exp)
 
 
 def sym_powm(m: torch.Tensor, p: float | torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -177,8 +204,11 @@ def sym_powm(m: torch.Tensor, p: float | torch.Tensor, eps: float = 1e-12) -> to
     broadcastable against the batch shape of ``m`` (i.e., ``m.shape[:-2]``).
     """
     if isinstance(p, torch.Tensor):
-        return _sym_eigh_func(m, lambda e: e.pow(p.unsqueeze(-1)), clamp_min=eps)
-    return _sym_eigh_func(m, lambda e: e.pow(p), clamp_min=eps)
+        e = p.unsqueeze(-1)
+        return _sym_eigh_func(
+            m, lambda x: x.pow(e), lambda x: e * x.pow(e - 1), clamp_min=eps, p_exp=e
+        )
+    return _sym_eigh_func(m, lambda x: x.pow(p), lambda x: p * x.pow(p - 1), clamp_min=eps)
 
 
 def sym_logm(m: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
@@ -187,25 +217,27 @@ def sym_logm(m: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
 
     Eigenvalues are clamped to ``eps`` for numerical safety.
     """
-    return _sym_eigh_func(m, torch.log, clamp_min=eps)
+    return _sym_eigh_func(m, torch.log, torch.reciprocal, clamp_min=eps)
 
 
 def sym_expm(m: torch.Tensor) -> torch.Tensor:
     """
     Matrix exponential of symmetric matrices via symmetric eigendecomposition.
     """
-    return _sym_eigh_func(m, torch.exp, clamp_min=None)
+    return _sym_eigh_func(m, torch.exp, torch.exp, clamp_min=None)
 
 
 def sym_sqrtm(m: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
     Symmetric positive definite square root of SPD matrices.
     """
-    return _sym_eigh_func(m, torch.sqrt, clamp_min=eps)
+    return _sym_eigh_func(m, torch.sqrt, lambda x: 0.5 * x.rsqrt(), clamp_min=eps)
 
 
 def sym_inv_sqrtm(m: torch.Tensor, eps: float = 1e-12) -> torch.Tensor:
     """
     Inverse symmetric positive definite square root of SPD matrices.
     """
-    return _sym_eigh_func(m, lambda e: e.rsqrt(), clamp_min=eps)
+    return _sym_eigh_func(
+        m, torch.rsqrt, lambda x: -0.5 * x.pow(-1.5), clamp_min=eps
+    )

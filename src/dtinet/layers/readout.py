@@ -72,7 +72,10 @@ class InvariantReadoutCoords(BaseInvariantReadout):
             weights = mask.to(x.dtype)
             denom = C * weights.sum(dim=(2, 3, 4))
             mean = (x * weights.unsqueeze(2)).sum(dim=(1, 3, 4, 5))
-            mean = mean / denom.clamp_min(torch.finfo(x.dtype).eps).view(B, 1)
+            # divide by the true valid count wherever it is positive
+            has_mass = denom > 0
+            denom_safe = torch.where(has_mass, denom, torch.ones_like(denom)).view(B, 1)
+            mean = torch.where(has_mass.view(B, 1), mean / denom_safe, torch.zeros_like(mean))
 
         out = (x - mean.view(B, 1, F, 1, 1, 1)).square().sum(dim=2)
 
