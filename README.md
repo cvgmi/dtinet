@@ -76,7 +76,7 @@ first few epochs, then rapid convergence to 1.00; use ~50 epochs and `--lr 1e-2`
    metric under `model.metric` (`lcm`, `lem`, or `aim`; set `activation: null` for `aim`).
 
    ```bash
-   cp configs/dtinetlc.example.yaml configs/local.yaml
+   cp configs/dtinet.example.yaml configs/local.yaml
    ```
 
 4. **Validate, then train**:

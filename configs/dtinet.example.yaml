@@ -1,9 +1,9 @@
 experiment:
-  name: dtinetlc_example
+  name: dtinet_example
   seed: 42
   deterministic: true
   device: cuda
-  output_dir: runs/dtinetlc_example
+  output_dir: runs/dtinet_example
 
 data:
   root: data
