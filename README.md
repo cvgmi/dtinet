@@ -32,15 +32,18 @@ as a smoke test: it exits nonzero unless validation accuracy reaches 0.9.
 ```bash
 uv run python examples/train_synthetic.py --metric lcm
 uv run python examples/train_synthetic.py --metric lem
-uv run python examples/train_synthetic.py --metric aim --epochs 50 --lr 1e-2
+uv run python examples/train_synthetic.py --metric aim
 ```
 
 Add `--device cuda` on a GPU machine (it is the default when CUDA is available).
+Training epochs and learning rate have metric-aware defaults (10 epochs at lr 3e-3
+for LCM/LEM; 50 epochs at lr 1e-2 for AIM) that can be overridden with `--epochs`
+and `--lr`.
 
-Reference results: LCM and LEM reach val acc ≥ 0.99 within the default 10 epochs (~10 s on
-CPU, faster on GPU). AIM converges more slowly per step and from a flat start (features
-begin near the identity, so early gradients are tiny) — expect chance-level accuracy for the
-first few epochs, then rapid convergence to 1.00; use ~50 epochs and `--lr 1e-2` as above.
+Reference results: LCM and LEM reach val acc ≥ 0.99 within 10 epochs (~10 s on
+CPU, faster on GPU). AIM converges more slowly per step and from a flat start
+(features begin near the identity, so early gradients are tiny) — expect
+chance-level accuracy for the first few epochs, then rapid convergence to 1.00.
 
 ## Training on your own DTI data
 

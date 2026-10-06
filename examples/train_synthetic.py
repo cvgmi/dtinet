@@ -30,8 +30,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--num-samples", type=int, default=512)
     parser.add_argument("--grid-size", type=int, default=8)
     parser.add_argument("--batch-size", type=int, default=32)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--lr", type=float, default=3e-3)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Training epochs (default: 10 for lcm/lem, 50 for aim).",
+    )
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=None,
+        help="Adam learning rate (default: 3e-3 for lcm/lem, 1e-2 for aim).",
+    )
     parser.add_argument("--channels", type=str, default="4,8")
     parser.add_argument("--kernel-size", type=int, default=3)
     parser.add_argument("--padding", type=int, default=1)
@@ -53,7 +63,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Do not pass a foreground mask to the model.",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    # AIM starts with near-identity features (tiny gradients), so it needs more
+    # epochs and a higher learning rate than the coordinate metrics.
+    if args.epochs is None:
+        args.epochs = 50 if args.metric == "aim" else 10
+    if args.lr is None:
+        args.lr = 1e-2 if args.metric == "aim" else 3e-3
+    return args
 
 
 def unpack(
