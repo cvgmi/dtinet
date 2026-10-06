@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train DTINetLC for PD-versus-control classification."""
+"""Train a ManifoldNet classifier (LCM/LEM/AIM) on a DTI cohort."""
 
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, Dataset
 
-from dtinet.models import DTINetLC
+from dtinet.models import ManifoldNetClassifier
 
 REQUIRED_SPLITS = ("train", "val", "test")
 
@@ -455,7 +455,7 @@ def main() -> int:
         "val": build_loader(datasets["val"], config, False, train_generator),
         "test": build_loader(datasets["test"], config, False, train_generator),
     }
-    model = DTINetLC(**config["model"]).to(device)
+    model = ManifoldNetClassifier(**config["model"]).to(device)
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(config["optimizer"]["learning_rate"]),
