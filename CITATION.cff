@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use dtinet in your work, please cite this software."
+title: "dtinet"
+type: software
+authors:
+  - family-names: "Cortes"
+    given-names: "Gianfranco"
+    orcid: "https://orcid.org/0009-0002-8819-3400"
+repository-code: "https://github.com/cvgmi/dtinet"
+license: "BSD-3-Clause"
