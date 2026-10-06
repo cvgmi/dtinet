@@ -6,6 +6,8 @@ The Voigt-6 representation stores the unique entries of a symmetric 3x3 matrix i
 work for arbitrary batch shapes (..., 3, 3).
 """
 
+import warnings
+
 import torch
 
 # index order shared by the whole library: (xx, xy, yy, xz, yz, zz)
@@ -37,6 +39,12 @@ def _eigh_slabs(flat: torch.Tensor, chunk: int) -> tuple[torch.Tensor, torch.Ten
         try:
             e, v = torch.linalg.eigh(slab)
         except RuntimeError:
+            warnings.warn(
+                "CUDA eigh failed on a slab; retrying on CPU "
+                "(this will slow training down considerably)",
+                RuntimeWarning,
+                stacklevel=2,
+            )
             e, v = torch.linalg.eigh(slab.cpu())
             e, v = e.to(flat.device), v.to(flat.device)
         evals.append(e)
