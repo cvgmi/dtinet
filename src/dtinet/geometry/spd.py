@@ -15,6 +15,55 @@ VOIGT6_OFFDIAG = (1, 3, 4)
 #: Eigenvalue gap below which the eigh backward treats a pair as degenerate.
 EIGH_GAP_EPS = 1e-12
 
+#: Batch count at which cuSOLVER's batched symmetric eigensolver
+#: (cusolverDnXsyevBatched) fails with CUSOLVER_STATUS_INTERNAL_ERROR
+#: (verified on L4 / torch 2.12.1+cu130: 2**16 - 1 works, 2**16 fails).
+_CUSOLVER_MAX_BATCH = 65535
+
+#: Chunk size for CUDA eigh calls: stays well under the cuSOLVER batch limit and
+#: bounds the transient solver workspace (~0.25 MB per 3x3 matrix on L4).
+_EIGH_CUDA_CHUNK = 32768
+
+
+def _eigh_slabs(flat: torch.Tensor, chunk: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Eigendecomposition of a flattened batch (B, n, n) computed in slabs.
+
+    Slabs that fail on the accelerator (e.g. cuSOLVER internal errors) are retried
+    on the CPU and moved back, so a single bad batch cannot abort training.
+    """
+    evals, evecs = [], []
+    for slab in flat.split(chunk):
+        try:
+            e, v = torch.linalg.eigh(slab)
+        except RuntimeError:
+            e, v = torch.linalg.eigh(slab.cpu())
+            e, v = e.to(flat.device), v.to(flat.device)
+        evals.append(e)
+        evecs.append(v)
+    return torch.cat(evals), torch.cat(evecs)
+
+
+def _linalg_eigh(m: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    ``torch.linalg.eigh`` with a workaround for cuSOLVER's batched-size limit.
+
+    CUDA batches larger than ``_EIGH_CUDA_CHUNK`` are split into slabs below the
+    2**16 syevBatched limit; smaller batches are computed directly, falling back
+    to slab-wise (and ultimately CPU) evaluation if the solver errors.
+    """
+    if not m.is_cuda:
+        return torch.linalg.eigh(m)
+    n = m.shape[-1]
+    flat = m.reshape(-1, n, n)
+    if flat.shape[0] <= _EIGH_CUDA_CHUNK:
+        try:
+            return torch.linalg.eigh(m)
+        except RuntimeError:
+            pass
+    evals, evecs = _eigh_slabs(flat, _EIGH_CUDA_CHUNK)
+    return evals.reshape(*m.shape[:-1]), evecs.reshape(*m.shape)
+
 
 class _SafeEigh(torch.autograd.Function):
     """
@@ -30,7 +79,7 @@ class _SafeEigh(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, m):
-        evals, evecs = torch.linalg.eigh(m)
+        evals, evecs = _linalg_eigh(m)
         ctx.save_for_backward(evals, evecs)
         return evals, evecs
 
