@@ -54,19 +54,12 @@ def test_flip_sign_rule_matches_reflection(axis):
     assert torch.allclose(voigt6_to_matrix(flipped), reflection @ m @ reflection)
 
 
-@pytest.mark.parametrize(
-    "architecture", ["manifold_resnet", "manifold_resnet_bimap", "coord_resnet"]
-)
-def test_resnet_models_respect_mask_and_train(architecture):
-    from experiments.models import CoordResNetClassifier, ManifoldResNetClassifier
+@pytest.mark.parametrize("bimap", [False, True])
+def test_manifold_resnet_respects_mask_and_trains(bimap):
+    from experiments.models import ManifoldResNetClassifier
 
     torch.manual_seed(0)
-    if architecture == "coord_resnet":
-        model = CoordResNetClassifier(2, 4, [8, 16], blocks_per_stage=1)
-    else:
-        model = ManifoldResNetClassifier(
-            2, 4, [8, 16], blocks_per_stage=1, bimap=architecture.endswith("bimap")
-        )
+    model = ManifoldResNetClassifier(2, 4, [8, 16], blocks_per_stage=1, bimap=bimap)
     model.eval()
     generator = torch.Generator().manual_seed(3)
     x = _spd_field(2, 12, generator)
@@ -90,9 +83,43 @@ def test_resnet_models_respect_mask_and_train(architecture):
 
 
 @pytest.mark.parametrize("kernel_size", [0, 2, 4])
-def test_resnets_reject_invalid_kernels(kernel_size):
-    from experiments.models import CoordResNetClassifier, ManifoldResNetClassifier
+def test_manifold_resnet_rejects_invalid_kernels(kernel_size):
+    from experiments.models import ManifoldResNetClassifier
 
-    for cls in (ManifoldResNetClassifier, CoordResNetClassifier):
-        with pytest.raises(ValueError, match="odd"):
-            cls(2, 4, [8], kernel_size=kernel_size)
+    with pytest.raises(ValueError, match="odd"):
+        ManifoldResNetClassifier(2, 4, [8], kernel_size=kernel_size)
+
+
+def test_cached_dataset_matches_uncached_and_is_not_mutated(tmp_path):
+    import nibabel as nib
+    import numpy as np
+
+    from experiments.train import DTILedgerDataset
+
+    rng = np.random.default_rng(0)
+    records = {}
+    for i in range(2):
+        a = rng.standard_normal((6, 5, 4, 3, 3))
+        m = a @ np.swapaxes(a, -1, -2) + np.eye(3)
+        voigt = np.stack([m[..., 0, 0], m[..., 0, 1], m[..., 1, 1], m[..., 0, 2],
+                          m[..., 1, 2], m[..., 2, 2]], axis=-1).astype(np.float32)
+        nib.save(nib.Nifti1Image(voigt, np.eye(4)), tmp_path / f"t{i}.nii.gz")
+        mask = nib.Nifti1Image(np.ones((6, 5, 4), np.uint8), np.eye(4))
+        nib.save(mask, tmp_path / f"m{i}.nii.gz")
+        records[f"s{i}"] = {"image_id": f"s{i}", "subject_id": f"s{i}", "label": i,
+                            "group": "g", "split": "train", "tensor_path": f"t{i}.nii.gz",
+                            "mask_path": f"m{i}.nii.gz"}
+    ledger = {"records": records}
+    args = (ledger, "train", tmp_path, (6, 5, 4), 1.0, 1000.0)
+    plain = DTILedgerDataset(*args)
+    cache = {}
+    cached = DTILedgerDataset(*args, (0, 1, 2), cache=cache)
+    reference = [plain[i]["tensor"].clone() for i in range(2)]
+    torch.manual_seed(0)
+    for _ in range(4):  # repeated random flips must never alter the cached arrays
+        for i in range(2):
+            cached[i]
+    unflipped = DTILedgerDataset(*args, cache=cache)
+    for i in range(2):
+        assert torch.equal(unflipped[i]["tensor"], reference[i])
+    assert len(cache) == 2

@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,6 @@ from sklearn.metrics import (
 from torch.utils.data import DataLoader, Dataset
 
 from experiments.models import (
-    CoordResNetClassifier,
     ManifoldNetClassifier,
     ManifoldResNetClassifier,
 )
@@ -37,7 +37,6 @@ REQUIRED_SPLITS = ("train", "val", "test")
 ARCHITECTURES = {
     "manifoldnet": ManifoldNetClassifier,
     "manifold_resnet": ManifoldResNetClassifier,
-    "coord_resnet": CoordResNetClassifier,
 }
 # Voigt-6 (xx, xy, yy, xz, yz, zz) off-diagonal components that change sign when image
 # axis 0, 1, or 2 is reflected
@@ -117,6 +116,7 @@ class DTILedgerDataset(Dataset):
         minimum_mask_retention: float,
         tensor_scale: float = 1.0,
         flip_axes: tuple[int, ...] = (),
+        cache: dict | None = None,
     ):
         self.records = [row for row in ledger["records"].values() if row["split"] == split]
         self.records.sort(key=lambda row: row["image_id"])
@@ -125,6 +125,8 @@ class DTILedgerDataset(Dataset):
         self.crop_xyz = crop_xyz
         self.minimum_mask_retention = minimum_mask_retention
         self.tensor_scale = tensor_scale
+        # optional mapping shared between datasets: (tensor_path, mask_path) -> loaded arrays
+        self.cache = cache
         # each listed image axis is mirrored with probability 1/2 per sample; reflecting
         # along axis k negates the two off-diagonal components involving k, which assumes
         # tensors are expressed in the image (voxel) frame
@@ -137,8 +139,11 @@ class DTILedgerDataset(Dataset):
     def __len__(self) -> int:
         return len(self.records)
 
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        record = self.records[index]
+    def _load(self, record: dict) -> tuple[np.ndarray, np.ndarray]:
+        """Validated, cropped, scaled (X, Y, Z, 6) float32 tensor and boolean mask."""
+        key = (record["tensor_path"], record["mask_path"])
+        if self.cache is not None and key in self.cache:
+            return self.cache[key]
         tensor_image = nib.load(resolve_data_path(self.data_root, record["tensor_path"]))
         mask_image = nib.load(resolve_data_path(self.data_root, record["mask_path"]))
         if tensor_image.shape[:3] != mask_image.shape or not np.allclose(
@@ -164,13 +169,28 @@ class DTILedgerDataset(Dataset):
         tensor = np.asarray(tensor[slices + (slice(None),)], dtype=np.float32)
         if self.tensor_scale != 1.0:
             tensor = tensor * np.float32(self.tensor_scale)
+        if not np.isfinite(tensor).all():
+            raise ValueError(f"Non-finite tensor values for {record['image_id']}")
+        if self.cache is not None:
+            # cached arrays are shared and must never be modified in place
+            tensor.flags.writeable = False
+            cropped_mask.flags.writeable = False
+            self.cache[key] = (tensor, cropped_mask)
+        return tensor, cropped_mask
+
+    def preload(self) -> None:
+        """Load every record into the shared cache."""
+        for record in self.records:
+            self._load(record)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        record = self.records[index]
+        tensor, cropped_mask = self._load(record)
         for axis in self.flip_axes:
             if torch.rand(()).item() < 0.5:
                 tensor = np.flip(tensor, axis=axis).copy()
                 cropped_mask = np.flip(cropped_mask, axis=axis)
                 tensor[..., VOIGT6_OFFDIAG_INVOLVING[axis]] *= -1
-        if not np.isfinite(tensor).all():
-            raise ValueError(f"Non-finite tensor values for {record['image_id']}")
         # (X,Y,Z,6) -> (C_in=1, coordinates=6, D=Z, H=X, W=Y)
         tensor = np.ascontiguousarray(tensor.transpose(3, 2, 0, 1)[None])
         spatial_mask = np.ascontiguousarray(cropped_mask.transpose(2, 0, 1)[None])
@@ -446,16 +466,20 @@ def main() -> int:
     tensor_scale = float(config["data"].get("tensor_scale", 1.0))
     if not tensor_scale > 0:
         raise ValueError(f"data.tensor_scale must be positive, got {tensor_scale}")
+    # keep every decompressed, cropped volume in RAM after its first load, so epochs need
+    # almost no CPU; one cache serves all splits and the augmented training dataset
+    cache = {} if bool(config["data"].get("cache_in_memory", False)) else None
     datasets = {
         split: DTILedgerDataset(
-            ledger, split, data_root, crop_xyz, minimum_retention, tensor_scale
+            ledger, split, data_root, crop_xyz, minimum_retention, tensor_scale, cache=cache
         )
         for split in REQUIRED_SPLITS
     }
     # random reflections for the training loader only; train-set evaluation stays unaugmented
     flip_axes = tuple(int(axis) for axis in config["data"].get("flip_axes", []))
     train_augmented = DTILedgerDataset(
-        ledger, "train", data_root, crop_xyz, minimum_retention, tensor_scale, flip_axes
+        ledger, "train", data_root, crop_xyz, minimum_retention, tensor_scale, flip_axes,
+        cache=cache,
     )
     print(f"Data root: {data_root}", flush=True)
     print(
@@ -497,6 +521,17 @@ def main() -> int:
     (output_dir / "ledger_reference.json").write_text(
         json.dumps({"path": str(ledger_path), "sha256": ledger["ledger_sha256"]}, indent=2) + "\n"
     )
+
+    if cache is not None:
+        start = time.perf_counter()
+        for dataset in datasets.values():
+            dataset.preload()
+        gib = sum(t.nbytes + m.nbytes for t, m in cache.values()) / 2**30
+        print(
+            f"Cached {len(cache)} volumes in memory ({gib:.2f} GiB) "
+            f"in {time.perf_counter() - start:.0f} s",
+            flush=True,
+        )
 
     train_generator = torch.Generator().manual_seed(seed)
     loaders = {

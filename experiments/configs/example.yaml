@@ -14,12 +14,15 @@ data:
   # off-diagonal (orientation) coordinates are not ~70x smaller than the diagonal ones
   tensor_scale: 1.0
   flip_axes: [] # e.g. [0] for random left-right reflections (image-frame tensors only)
+  # keep decompressed volumes in RAM (about 12 MB per 80x104x60 scan); epochs then need
+  # almost no CPU, so num_workers: 0 and one CPU per job suffice
+  cache_in_memory: false
   batch_size: 2
   num_workers: 4
   pin_memory: true
 
 model:
-  architecture: manifoldnet # manifoldnet | manifold_resnet | coord_resnet (see README)
+  architecture: manifoldnet # manifoldnet | manifold_resnet (see README)
   metric: lcm # lcm | lem | aim; activation must be null for aim
   num_classes: 2
   num_layers: 4
