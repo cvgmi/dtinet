@@ -54,6 +54,10 @@ class WeightedFrechetMean3dCoords(BaseWeightedFrechetMean3d):
         Stride of cubic kernel.
     padding : int, optional
         Padding applied to the input.
+    init_std : float, optional
+        Standard deviation of the normal initialization of the pre-softmax weights. Must be
+        positive to break symmetry: with constant logits every output channel starts as the
+        same uniform filter and receives gradients along the same direction.
 
     """
 
@@ -65,6 +69,7 @@ class WeightedFrechetMean3dCoords(BaseWeightedFrechetMean3d):
         metric: str = "lcm",
         stride: int = 1,
         padding: int = 0,
+        init_std: float = 1.0,
     ):
         super().__init__()
 
@@ -79,13 +84,14 @@ class WeightedFrechetMean3dCoords(BaseWeightedFrechetMean3d):
         self.padding = padding
 
         self.weight = nn.Parameter(
-            torch.zeros(
+            torch.randn(
                 self.out_channels,
                 self.in_channels,
                 self.kernel_size,
                 self.kernel_size,
                 self.kernel_size,
             )
+            * init_std
         )
 
     def constrain_weight(self) -> torch.Tensor:

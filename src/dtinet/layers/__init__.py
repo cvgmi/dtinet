@@ -21,6 +21,7 @@ from dtinet.layers.batchnorm import (
     FrechetBatchNorm3dCoords,
     FrechetBatchNorm3dLC,
 )
+from dtinet.layers.bimap import BiMap3dLC
 from dtinet.layers.coords import SPD3ToLC, SPDToCoords
 from dtinet.layers.readout import (
     BaseInvariantReadout,
@@ -28,6 +29,7 @@ from dtinet.layers.readout import (
     InvariantReadoutCoords,
     InvariantReadoutLC,
 )
+from dtinet.layers.residual import ManifoldResidualBlock3d
 from dtinet.layers.wfm import (
     BaseWeightedFrechetMean3d,
     WeightedFrechetMean3d,
@@ -39,6 +41,7 @@ __all__ = [
     "BaseFrechetBatchNorm3d",
     "BaseInvariantReadout",
     "BaseWeightedFrechetMean3d",
+    "BiMap3dLC",
     "FrechetBatchNorm3d",
     "FrechetBatchNorm3dAIM",
     "FrechetBatchNorm3dCoords",
@@ -47,6 +50,7 @@ __all__ = [
     "InvariantReadoutAIM",
     "InvariantReadoutCoords",
     "InvariantReadoutLC",
+    "ManifoldResidualBlock3d",
     "SPD3ToLC",
     "SPDToCoords",
     "WeightedFrechetMean3d",
