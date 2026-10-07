@@ -27,9 +27,21 @@ from sklearn.metrics import (
 )
 from torch.utils.data import DataLoader, Dataset
 
-from dtinet.models import ManifoldNetClassifier
+from experiments.models import (
+    CoordResNetClassifier,
+    ManifoldNetClassifier,
+    ManifoldResNetClassifier,
+)
 
 REQUIRED_SPLITS = ("train", "val", "test")
+ARCHITECTURES = {
+    "manifoldnet": ManifoldNetClassifier,
+    "manifold_resnet": ManifoldResNetClassifier,
+    "coord_resnet": CoordResNetClassifier,
+}
+# Voigt-6 (xx, xy, yy, xz, yz, zz) off-diagonal components that change sign when image
+# axis 0, 1, or 2 is reflected
+VOIGT6_OFFDIAG_INVOLVING = {0: [1, 3], 1: [1, 4], 2: [3, 4]}
 
 
 def parse_args() -> argparse.Namespace:
@@ -103,6 +115,8 @@ class DTILedgerDataset(Dataset):
         data_root: Path,
         crop_xyz: tuple[int, int, int],
         minimum_mask_retention: float,
+        tensor_scale: float = 1.0,
+        flip_axes: tuple[int, ...] = (),
     ):
         self.records = [row for row in ledger["records"].values() if row["split"] == split]
         self.records.sort(key=lambda row: row["image_id"])
@@ -110,6 +124,13 @@ class DTILedgerDataset(Dataset):
         self.data_root = data_root.resolve()
         self.crop_xyz = crop_xyz
         self.minimum_mask_retention = minimum_mask_retention
+        self.tensor_scale = tensor_scale
+        # each listed image axis is mirrored with probability 1/2 per sample; reflecting
+        # along axis k negates the two off-diagonal components involving k, which assumes
+        # tensors are expressed in the image (voxel) frame
+        self.flip_axes = tuple(flip_axes)
+        if any(axis not in (0, 1, 2) for axis in self.flip_axes):
+            raise ValueError(f"flip_axes must be image axes 0, 1, or 2, got {flip_axes}")
         if not self.records:
             raise ValueError(f"Ledger split {split!r} is empty")
 
@@ -141,6 +162,13 @@ class DTILedgerDataset(Dataset):
                 f"for {record['image_id']}"
             )
         tensor = np.asarray(tensor[slices + (slice(None),)], dtype=np.float32)
+        if self.tensor_scale != 1.0:
+            tensor = tensor * np.float32(self.tensor_scale)
+        for axis in self.flip_axes:
+            if torch.rand(()).item() < 0.5:
+                tensor = np.flip(tensor, axis=axis).copy()
+                cropped_mask = np.flip(cropped_mask, axis=axis)
+                tensor[..., VOIGT6_OFFDIAG_INVOLVING[axis]] *= -1
         if not np.isfinite(tensor).all():
             raise ValueError(f"Non-finite tensor values for {record['image_id']}")
         # (X,Y,Z,6) -> (C_in=1, coordinates=6, D=Z, H=X, W=Y)
@@ -181,8 +209,12 @@ def validate_ledger(ledger: dict) -> None:
     missing = sorted(required - ledger.keys())
     if missing:
         raise ValueError(f"Ledger is missing keys: {missing}")
-    if ledger["label_map"] != {"Control": 0, "PD": 1}:
-        raise ValueError(f"Unexpected label mapping: {ledger['label_map']}")
+    # binary tasks only: metrics, subject aggregation, and thresholds use P(class 1)
+    label_map = ledger["label_map"]
+    if not isinstance(label_map, dict) or sorted(label_map.values()) != [0, 1]:
+        raise ValueError(
+            f"label_map must map exactly two group names to 0 and 1, got: {label_map}"
+        )
     claimed_hash = ledger["ledger_sha256"]
     unhashed = {key: value for key, value in ledger.items() if key != "ledger_sha256"}
     observed_hash = canonical_hash(unhashed)
@@ -228,7 +260,9 @@ def build_loader(
     )
 
 
-def classification_metrics(labels: np.ndarray, probabilities: np.ndarray) -> dict:
+def classification_metrics(
+    labels: np.ndarray, probabilities: np.ndarray, class_names: list[str]
+) -> dict:
     predictions = (probabilities >= 0.5).astype(np.int64)
     tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
     both_classes = len(np.unique(labels)) == 2
@@ -244,13 +278,13 @@ def classification_metrics(labels: np.ndarray, probabilities: np.ndarray) -> dic
         "accuracy": float(np.mean(labels == predictions)),
         "n": int(len(labels)),
         "class_counts": {
-            "Control": int(np.sum(labels == 0)),
-            "PD": int(np.sum(labels == 1)),
+            class_names[0]: int(np.sum(labels == 0)),
+            class_names[1]: int(np.sum(labels == 1)),
         },
     }
 
 
-def aggregate_subjects(scan_rows: list[dict]) -> list[dict]:
+def aggregate_subjects(scan_rows: list[dict], class_names: list[str]) -> list[dict]:
     grouped = defaultdict(list)
     for row in scan_rows:
         grouped[row["subject_id"]].append(row)
@@ -259,14 +293,14 @@ def aggregate_subjects(scan_rows: list[dict]) -> list[dict]:
         labels = {row["label"] for row in rows}
         if len(labels) != 1:
             raise ValueError(f"Inconsistent labels for subject {subject_id}")
-        probability = float(np.mean([row["probability_pd"] for row in rows]))
+        probability = float(np.mean([row["probability_positive"] for row in rows]))
         label = labels.pop()
         subjects.append(
             {
                 "subject_id": subject_id,
                 "label": label,
-                "group": "PD" if label else "Control",
-                "probability_pd": probability,
+                "group": class_names[label],
+                "probability_positive": probability,
                 "prediction": int(probability >= 0.5),
                 "n_scans": len(rows),
             }
@@ -281,6 +315,7 @@ def evaluate(
     device: torch.device,
     criterion: torch.nn.Module,
     amp: bool,
+    class_names: list[str],
 ) -> tuple[dict, list[dict], list[dict]]:
     model.eval()
     total_loss = 0.0
@@ -304,19 +339,19 @@ def evaluate(
                     "subject_id": batch["subject_id"][index],
                     "label": int(label_values[index]),
                     "group": batch["group"][index],
-                    "probability_pd": float(probability),
+                    "probability_positive": float(probability),
                     "prediction": int(probability >= 0.5),
                 }
             )
     scan_labels = np.array([row["label"] for row in scan_rows])
-    scan_probabilities = np.array([row["probability_pd"] for row in scan_rows])
-    subject_rows = aggregate_subjects(scan_rows)
+    scan_probabilities = np.array([row["probability_positive"] for row in scan_rows])
+    subject_rows = aggregate_subjects(scan_rows, class_names)
     subject_labels = np.array([row["label"] for row in subject_rows])
-    subject_probabilities = np.array([row["probability_pd"] for row in subject_rows])
+    subject_probabilities = np.array([row["probability_positive"] for row in subject_rows])
     metrics = {
         "loss": total_loss / total_samples,
-        "scan": classification_metrics(scan_labels, scan_probabilities),
-        "subject": classification_metrics(subject_labels, subject_probabilities),
+        "scan": classification_metrics(scan_labels, scan_probabilities, class_names),
+        "subject": classification_metrics(subject_labels, subject_probabilities, class_names),
     }
     return metrics, scan_rows, subject_rows
 
@@ -407,10 +442,21 @@ def main() -> int:
     validate_ledger(ledger)
     crop_xyz = tuple(int(value) for value in config["data"]["crop_xyz"])
     minimum_retention = float(config["data"]["minimum_mask_retention"])
+    # unit conversion applied to every tensor on load (e.g. 1000 for mm^2/s -> um^2/ms)
+    tensor_scale = float(config["data"].get("tensor_scale", 1.0))
+    if not tensor_scale > 0:
+        raise ValueError(f"data.tensor_scale must be positive, got {tensor_scale}")
     datasets = {
-        split: DTILedgerDataset(ledger, split, data_root, crop_xyz, minimum_retention)
+        split: DTILedgerDataset(
+            ledger, split, data_root, crop_xyz, minimum_retention, tensor_scale
+        )
         for split in REQUIRED_SPLITS
     }
+    # random reflections for the training loader only; train-set evaluation stays unaugmented
+    flip_axes = tuple(int(axis) for axis in config["data"].get("flip_axes", []))
+    train_augmented = DTILedgerDataset(
+        ledger, "train", data_root, crop_xyz, minimum_retention, tensor_scale, flip_axes
+    )
     print(f"Data root: {data_root}", flush=True)
     print(
         "Dataset: " + ", ".join(f"{split}={len(dataset)}" for split, dataset in datasets.items()),
@@ -425,6 +471,10 @@ def main() -> int:
                 f"image={sample['image_id']}",
                 flush=True,
             )
+        model_config = dict(config["model"])
+        architecture = model_config.pop("architecture", "manifoldnet")
+        ARCHITECTURES[architecture](**model_config)
+        print(f"Model {architecture!r} constructs.", flush=True)
         print("Configuration, ledger, and sample validation passed.", flush=True)
         return 0
 
@@ -450,12 +500,25 @@ def main() -> int:
 
     train_generator = torch.Generator().manual_seed(seed)
     loaders = {
-        "train": build_loader(datasets["train"], config, True, train_generator),
+        "train": build_loader(train_augmented, config, True, train_generator),
         "train_eval": build_loader(datasets["train"], config, False, train_generator),
         "val": build_loader(datasets["val"], config, False, train_generator),
         "test": build_loader(datasets["test"], config, False, train_generator),
     }
-    model = ManifoldNetClassifier(**config["model"]).to(device)
+    if int(config["model"].get("num_classes", 2)) != 2:
+        raise ValueError("The trainer supports binary tasks only; set model.num_classes: 2")
+    model_config = dict(config["model"])
+    architecture = model_config.pop("architecture", "manifoldnet")
+    if architecture not in ARCHITECTURES:
+        raise ValueError(
+            f"Unknown model.architecture {architecture!r}; choose from {sorted(ARCHITECTURES)}"
+        )
+    model = ARCHITECTURES[architecture](**model_config).to(device)
+    print(
+        f"Model: {architecture}, "
+        f"{sum(p.numel() for p in model.parameters()):,} parameters",
+        flush=True,
+    )
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=float(config["optimizer"]["learning_rate"]),
@@ -463,14 +526,25 @@ def main() -> int:
     )
     epochs = int(config["training"]["epochs"])
     warmup = int(config["training"]["warmup_epochs"])
+    # after the linear warmup: "cosine" decays to zero at the last epoch, "constant" holds
+    lr_schedule = config["training"].get("lr_schedule", "cosine")
+    if lr_schedule not in ("cosine", "constant"):
+        raise ValueError(
+            f"training.lr_schedule must be 'cosine' or 'constant', got {lr_schedule!r}"
+        )
 
     def lr_lambda(epoch: int) -> float:
         if epoch < warmup:
             return (epoch + 1) / warmup
+        if lr_schedule == "constant":
+            return 1.0
         progress = (epoch - warmup) / max(epochs - warmup, 1)
         return 0.5 * (1 + math.cos(math.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    class_names = [None] * len(ledger["label_map"])
+    for group_name, class_index in ledger["label_map"].items():
+        class_names[class_index] = group_name
     train_labels = np.array([row["label"] for row in datasets["train"].records])
     counts = np.bincount(train_labels, minlength=2)
     class_weights = len(train_labels) / (2 * counts)
@@ -478,7 +552,10 @@ def main() -> int:
         weight=torch.tensor(class_weights, dtype=torch.float32, device=device)
     )
     print(
-        f"Training class weights: Control={class_weights[0]:.6f}, PD={class_weights[1]:.6f}",
+        "Training class weights: "
+        + ", ".join(
+            f"{name}={class_weights[i]:.6f}" for i, name in enumerate(class_names)
+        ),
         flush=True,
     )
     scaler = torch.amp.GradScaler(device.type, enabled=amp)
@@ -501,7 +578,16 @@ def main() -> int:
     if start_epoch == 0:
         history_path.write_text("")
     patience = int(config["training"]["early_stopping_patience"])
+    # maximum global gradient norm; 0 disables clipping (AIM benefits from 1.0)
+    grad_clip = float(config["training"].get("grad_clip", 0.0))
     eval_train_every = int(config["training"]["eval_train_every"])
+    # validation scan metric used for checkpoint selection and early stopping
+    selection_name = config["training"].get("selection_metric", "balanced_accuracy")
+    if selection_name not in ("balanced_accuracy", "roc_auc"):
+        raise ValueError(
+            "training.selection_metric must be 'balanced_accuracy' or 'roc_auc', "
+            f"got {selection_name!r}"
+        )
     for epoch in range(start_epoch, epochs):
         model.train()
         total_loss = 0.0
@@ -514,12 +600,18 @@ def main() -> int:
             with torch.amp.autocast(device_type=device.type, enabled=amp):
                 loss = criterion(model(tensor, mask), labels)
             scaler.scale(loss).backward()
+            if grad_clip > 0:
+                # unscale first so the threshold applies to the true gradient norm
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
             total_loss += float(loss.item()) * len(labels)
             total_samples += len(labels)
         train_loss = total_loss / total_samples
-        val_metrics, _, _ = evaluate(model, loaders["val"], device, criterion, amp)
+        val_metrics, _, _ = evaluate(
+            model, loaders["val"], device, criterion, amp, class_names
+        )
         scheduler.step()
         row = {
             "epoch": epoch + 1,
@@ -528,9 +620,11 @@ def main() -> int:
             "val": val_metrics,
         }
         if epoch == 0 or (epoch + 1) % eval_train_every == 0:
-            train_metrics, _, _ = evaluate(model, loaders["train_eval"], device, criterion, amp)
+            train_metrics, _, _ = evaluate(
+                model, loaders["train_eval"], device, criterion, amp, class_names
+            )
             row["train"] = train_metrics
-        selection = val_metrics["scan"]["balanced_accuracy"]
+        selection = val_metrics["scan"][selection_name]
         improved = selection > best_metric
         if improved:
             best_metric = selection
@@ -558,7 +652,8 @@ def main() -> int:
             f"epoch={epoch + 1:03d} train_loss={train_loss:.5f} "
             f"val_loss={val_metrics['loss']:.5f} "
             f"val_auc={val_metrics['scan']['roc_auc']:.4f} "
-            f"val_bal_acc={selection:.4f} best={best_metric:.4f} "
+            f"val_bal_acc={val_metrics['scan']['balanced_accuracy']:.4f} "
+            f"best_{selection_name}={best_metric:.4f} "
             f"bad_epochs={bad_epochs} lr={optimizer.param_groups[0]['lr']:.3e}",
             flush=True,
         )
@@ -568,11 +663,13 @@ def main() -> int:
 
     best = torch.load(output_dir / "best.pt", map_location=device, weights_only=False)
     model.load_state_dict(best["model"])
-    test_metrics, scan_rows, subject_rows = evaluate(model, loaders["test"], device, criterion, amp)
+    test_metrics, scan_rows, subject_rows = evaluate(
+        model, loaders["test"], device, criterion, amp, class_names
+    )
     final = {
         "best_epoch": int(best["epoch"] + 1),
-        "selection_metric": "validation scan balanced_accuracy",
-        "best_validation_balanced_accuracy": float(best["best_metric"]),
+        "selection_metric": f"validation scan {selection_name}",
+        f"best_validation_{selection_name}": float(best["best_metric"]),
         "test": test_metrics,
         "ledger_sha256": ledger["ledger_sha256"],
         "config_sha256": config_sha256,

@@ -1,0 +1,44 @@
+experiment:
+  name: dtinet_example
+  seed: 42
+  deterministic: true
+  device: cuda
+  output_dir: runs/dtinet_example
+
+data:
+  root: data/my-cohort # dataset folder; ledger and record paths are relative to it
+  ledger: training/ledger.json
+  crop_xyz: [87, 96, 58]
+  minimum_mask_retention: 0.99
+  # multiply tensors on load; use 1000 for tensors in mm^2/s (-> um^2/ms) so log-Cholesky
+  # off-diagonal (orientation) coordinates are not ~70x smaller than the diagonal ones
+  tensor_scale: 1.0
+  flip_axes: [] # e.g. [0] for random left-right reflections (image-frame tensors only)
+  batch_size: 2
+  num_workers: 4
+  pin_memory: true
+
+model:
+  architecture: manifoldnet # manifoldnet | manifold_resnet | coord_resnet (see README)
+  metric: lcm # lcm | lem | aim; activation must be null for aim
+  num_classes: 2
+  num_layers: 4
+  num_channels: [4, 8, 16, 16]
+  activation: elu
+  kernel_size: 3
+  stride: 2
+  padding: 1
+
+optimizer:
+  learning_rate: 0.0001
+  weight_decay: 0.001
+
+training:
+  epochs: 50
+  warmup_epochs: 5
+  lr_schedule: cosine # cosine (decays to zero) or constant, after the warmup
+  early_stopping_patience: 15
+  grad_clip: 0.0 # max gradient norm; 0 disables (use 1.0 for metric: aim)
+  selection_metric: balanced_accuracy # or roc_auc; validation metric for checkpoint selection
+  eval_train_every: 2
+  amp: true

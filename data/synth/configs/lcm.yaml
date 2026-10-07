@@ -1,0 +1,41 @@
+# Synthetic isotropic-vs-anisotropic task; doubles as an end-to-end smoke test.
+# Generate the data first: uv run python data/synth/generate.py
+experiment:
+  name: synth_lcm
+  seed: 0
+  deterministic: true
+  device: cuda
+  output_dir: runs/synth/lcm
+
+data:
+  root: data/synth
+  ledger: training/ledger.json
+  crop_xyz: [8, 8, 8]
+  minimum_mask_retention: 1.0
+  batch_size: 32
+  num_workers: 0
+  pin_memory: false
+
+model:
+  architecture: manifoldnet
+  metric: lcm
+  num_classes: 2
+  num_layers: 2
+  num_channels: [4, 8]
+  activation: relu
+  kernel_size: 3
+  padding: 1
+
+optimizer:
+  learning_rate: 0.003
+  weight_decay: 0.0
+
+training:
+  epochs: 10
+  warmup_epochs: 0
+  lr_schedule: constant
+  early_stopping_patience: 10
+  eval_train_every: 10
+  grad_clip: 1.0
+  selection_metric: balanced_accuracy
+  amp: false

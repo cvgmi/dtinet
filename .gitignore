@@ -47,6 +47,11 @@ Thumbs.db
 # user-provided data and generated outputs
 /data/*
 !/data/.gitkeep
+# example dataset: generator, configs, and docs are tracked; generated files are not
+!/data/synth/
+/data/synth/tensors/
+/data/synth/masks/
+/data/synth/training/
 /runs/
 *.nii
 *.nii.gz
@@ -55,10 +60,8 @@ Thumbs.db
 *.pt
 *.pth
 
-# local configuration is private; portable examples may be committed
-/configs/*.yaml
-!/configs/*.example.yaml
-!/configs/.gitkeep
+# local configuration is private; the portable example lives in experiments/configs/
+/configs/
 
 # local tool state
 .uv/

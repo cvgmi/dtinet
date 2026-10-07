@@ -12,9 +12,6 @@ dependencies = [
     "torch>=2.12.1",
 ]
 
-[project.scripts]
-train = "dtinet.train:main"
-
 [build-system]
 requires = ["uv_build>=0.8.17,<0.9.0"]
 build-backend = "uv_build"
@@ -27,9 +24,14 @@ dev = [
 
 [tool.ruff]
 line-length = 100
-src = ["src"]
+src = ["src", "."]
 target-version = "py311"
 
 [tool.ruff.lint]
 ignore = ["E741"]
 select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+# experiments/ is a top-level package run from the repository root
+pythonpath = ["."]
+testpaths = ["tests", "experiments/tests"]
